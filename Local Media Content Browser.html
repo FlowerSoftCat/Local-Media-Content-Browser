@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>高级离线预览器 - 完美连播版</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        body { background: #000; color: #fff; overflow: hidden; font-family: "PingFang SC", sans-serif; user-select: none; -webkit-user-select: none; }
+        .glass { background: rgba(0,0,0,0.5); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; }
+        .highlight { color: #face15; font-weight: bold; }
+
+        .drawer {
+            position: absolute; right: 0; top: 0; bottom: 0; width: 500px;
+            background: rgba(0,0,0,0.95); backdrop-filter: blur(30px);
+            transform: translateX(100%); transition: 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 200; border-left: 1px solid rgba(255,255,255,0.1);
+        }
+        .drawer-open { transform: translateX(0); }
+        .work-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+        .thumb-item { position: relative; aspect-ratio: 3/4; border-radius: 4px; overflow: hidden; border: 2px solid transparent; cursor: pointer; transition: 0.2s; }
+        .thumb-item:hover { transform: scale(1.05); z-index: 10; }
+        .thumb-active { border-color: #fe2c55; }
+
+        .nav-btn { 
+            position: absolute; top: 50%; transform: translateY(-50%);
+            width: 54px; height: 54px; border-radius: 50%; background: rgba(255,255,255,0.1);
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; transition: 0.3s; z-index: 100;
+        }
+        .nav-btn:hover { background: rgba(255,255,255,0.25); transform: translateY(-50%) scale(1.1); }
+        
+        input[type="range"] { accent-color: #fe2c55; }
+        .hide-ui { opacity: 0; pointer-events: none; transition: 0.5s; }
+        
+        .custom-scroll::-webkit-scrollbar { width: 4px; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
+        
+        .carousel-bar {
+            background: rgba(255,255,255,0.08); backdrop-filter: blur(10px);
+            border-radius: 20px; padding: 6px 14px;
+            border: 1px solid rgba(255,255,255,0.12);
+        }
+    </style>
+</head>
+<body>
+    <div id="app" class="relative w-screen h-screen overflow-hidden">
+        
+        <!-- 背景高斯模糊 -->
+        <div class="absolute inset-0 z-0">
+            <template v-if="currentWork">
+                <img :src="currentDisplayUrl" class="w-full h-full object-cover filter blur-[110px] opacity-40 scale-110 transition-all duration-1000">
+            </template>
+        </div>
+
+        <!-- 背景音频：绑定到当前作品所属作者 -->
+        <audio v-if="currentWorkAudioUrl" ref="bgAudio" :src="currentWorkAudioUrl" loop class="hidden"></audio>
+
+        <!-- 空状态上传 -->
+        <div v-if="works.length === 0" class="absolute inset-0 z-[300] flex items-center justify-center" style="background: radial-gradient(ellipse at center, #1a1a2e 0%, #0a0a0f 100%);">
+            <div class="glass p-12 text-center max-w-md w-full mx-8" style="border-radius: 24px;">
+                <div class="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-6 border border-white/10">
+                    <i class="fas fa-folder-open text-2xl text-gray-400"></i>
+                </div>
+                <h1 class="text-2xl font-bold mb-2 tracking-tight">离线作品媒体中心</h1>
+                <p class="text-gray-400 text-sm mb-8">选择包含作品的本地目录开始浏览</p>
+                <label class="bg-[#fe2c55] text-white px-10 py-4 rounded-full cursor-pointer hover:bg-[#e0264d] transition-all font-bold text-lg shadow-xl active:scale-95 inline-block">
+                    选择素材总目录
+                    <input type="file" webkitdirectory directory multiple @change="handleFileScan" class="hidden">
+                </label>
+            </div>
+        </div>
+
+        <!-- 内容渲染层 -->
+        <div v-if="works.length > 0" ref="contentWrapper" class="relative z-10 w-full h-full flex items-center justify-center" @click="handleContentClick">
+            
+            <!-- 左右切换箭头 -->
+            <template v-if="!isCleanMode">
+                <div class="nav-btn left-12" @click="prevSub" :title="currentWork?.type === 'video' ? '快退5秒' : '上一张'"><i class="fas fa-chevron-left"></i></div>
+                <div class="nav-btn right-12" @click="nextSub" :title="currentWork?.type === 'video' ? '快进5秒' : '下一张'"><i class="fas fa-chevron-right"></i></div>
+            </template>
+
+            <!-- 核心播放器 -->
+            <div class="max-w-full max-h-full flex items-center justify-center relative">
+
+                <!-- 图文暂停/播放按钮 -->
+                <div v-if="currentWork && currentItem.type !== 'video'"
+                    :class="['absolute z-[100] inset-0 m-auto w-20 h-20 rounded-full bg-white/10 backdrop-blur-md border border-white/20 flex items-center justify-center cursor-pointer transition-all duration-300 hover:bg-white/25 hover:scale-110', isPaused ? 'opacity-100' : 'opacity-0 hover:opacity-100']"
+                    @click.stop="togglePause">
+                    <i :class="['fas text-2xl text-white transition-all', isPaused ? 'fa-play' : 'fa-pause']"></i>
+                </div>
+                <video v-if="currentItem.type === 'video'"
+                    ref="videoPlayer" :src="currentItem.url"
+                    class="max-h-[98vh] max-w-full object-contain shadow-2xl"
+                    autoplay :muted="isMuted" 
+                    :loop="currentWork.items.length > 1"
+                    @ended="onMediaEnded" @timeupdate="onVideoUpdate"
+                    @loadedmetadata="onVideoMeta" @click.stop="toggleVideoPlay"></video>
+                
+                <img v-else :src="currentItem.url" :key="currentItem.url"
+                    class="max-h-[98vh] max-w-full object-contain shadow-2xl">
+            </div>
+
+            <!-- 右侧操作区 -->
+            <div :class="['absolute right-8 top-[35%] z-[150] flex flex-col items-center', isCleanMode ? 'hide-ui' : '']">
+                <div @click="toggleDrawer" class="cursor-pointer group relative">
+                    <div class="w-16 h-16 rounded-full border-2 border-white/90 overflow-hidden shadow-2xl transition group-hover:rotate-12 group-hover:scale-110">
+                        <img :src="`https://api.dicebear.com/7.x/shapes/svg?seed=${currentWork.authorId}`" class="bg-indigo-900">
+                    </div>
+                    <div class="absolute -bottom-1 left-1/2 -translate-x-1/2 bg-[#fe2c55] rounded-full w-6 h-6 flex items-center justify-center border-2 border-black">
+                        <i :class="['fas text-[10px]', isDrawerOpen ? 'fa-times' : 'fa-th-large']"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 作者主页抽屉 -->
+            <div :class="['drawer p-8 flex flex-col', isDrawerOpen ? 'drawer-open' : '']">
+                <div class="flex items-center justify-between mb-8">
+                    <div>
+                        <h2 class="text-2xl font-black truncate">@{{ currentWork.authorName }}</h2>
+                        <p class="text-gray-500 text-xs mt-1">{{ authorWorks.length }} 作品</p>
+                    </div>
+                    <i @click="isDrawerOpen = false" class="fas fa-times text-xl cursor-pointer opacity-50 hover:opacity-100"></i>
+                </div>
+                <div class="flex-grow overflow-y-auto custom-scroll pr-2">
+                    <div class="work-grid">
+                        <div v-for="w in authorWorks" :key="w.id" 
+                            @click="jumpTo(w.index)"
+                            :class="['thumb-item', w.index === currentWorkIndex ? 'thumb-active' : '']">
+                            <img :src="w.cover" class="w-full h-full object-cover">
+                            <div v-if="w.isAlbum" class="absolute top-1 right-1 bg-black/50 p-1 rounded text-[8px]">
+                                <i class="fas fa-images"></i>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 左下角文案 + 音频信息 -->
+            <div :class="['absolute left-10 bottom-28 max-w-[50%] z-50 flex flex-col space-y-3', isCleanMode ? 'hide-ui' : '']">
+                <h3 class="text-2xl font-black drop-shadow-lg tracking-tight italic">@{{ currentWork.authorName }}</h3>
+                <div class="glass px-6 py-5 inline-block shadow-2xl">
+                    <p class="text-lg font-medium leading-relaxed" v-html="formatDesc(currentWork.title)"></p>
+                </div>
+                <!-- 音频：仅当前作品所属作者有音频时显示 -->
+                <div v-if="currentWorkAudioName" class="glass px-4 py-2 inline-flex items-center space-x-2 shadow-lg">
+                    <i class="fas fa-music text-[#fe2c55] text-sm"></i>
+                    <span class="text-sm text-gray-300 truncate max-w-[300px]">{{ currentWorkAudioName }}</span>
+                    <span class="text-xs text-gray-500">({{ currentWork?.type === 'video' ? '已暂停' : (isPaused ? '已暂停' : '播放中') }})</span>
+                </div>
+            </div>
+
+            <!-- 底部控制 -->
+            <div class="absolute bottom-0 w-full h-32 bg-gradient-to-t from-black/80 to-transparent flex flex-col justify-end px-10 pb-8 z-50">
+                <div v-if="currentWork.items.length > 1" class="flex justify-center items-center mb-5">
+                    <div class="carousel-bar flex items-center space-x-2">
+                        <div v-for="(item, i) in currentWork.items" :key="i"
+                            @click="subIndex = i; startAlbumCycle()"
+                            :class="['rounded-full cursor-pointer transition-all duration-300',
+                                i === subIndex ? 'bg-[#fe2c55] w-6 h-2 shadow-[0_0_8px_rgba(254,44,85,0.6)]' : 'bg-white/30 hover:bg-white/55 w-3 h-2']">
+                        </div>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-6">
+                    <div class="flex-grow h-1.5 bg-white/10 rounded-full relative cursor-pointer group" @click="handleSeek" @mousedown.stop>
+                        <div class="absolute h-full bg-[#fe2c55] rounded-full transition-all" :style="{width: progress + '%'}"></div>
+                        <div class="absolute h-4 w-4 bg-white rounded-full -top-1.5 shadow-lg opacity-0 group-hover:opacity-100 transition-opacity" :style="{left: `calc(${progress}% - 8px)`}"></div>
+                    </div>
+                    <span class="text-xs font-mono opacity-50 w-24 text-right">{{ timeDisplay }}</span>
+                    <div class="flex items-center space-x-5 text-gray-400">
+                        <i @click="isMuted = !isMuted" :class="['fas cursor-pointer text-lg hover:text-white', isMuted ? 'fa-volume-mute text-[#fe2c55]' : 'fa-volume-up']"></i>
+                        <div @click="isAutoNext = !isAutoNext" class="flex items-center cursor-pointer group">
+                            <span class="text-xs mr-2 group-hover:text-white transition">连播</span>
+                            <div :class="['w-8 h-4 rounded-full relative', isAutoNext ? 'bg-[#fe2c55]' : 'bg-gray-600']">
+                                <div :class="['absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all', isAutoNext ? 'right-0.5' : 'left-0.5']"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+const { createApp, ref, computed, onMounted, onUnmounted, watch, nextTick } = Vue;
+
+const AUDIO_EXTS = new Set(['mp3','wav','flac','aac','ogg','wma','m4a','opus','aiff','ape','wv','weba','ra','amr','mid','midi']);
+
+createApp({
+    setup() {
+        const works = ref([]);
+        const currentWorkIndex = ref(0);
+        const subIndex = ref(0);
+        
+        const isMuted = ref(false);
+        const isAutoNext = ref(true);
+        const isCleanMode = ref(false);
+        const isDrawerOpen = ref(false);
+        const videoPlayer = ref(null);
+        const bgAudio = ref(null);
+        const contentWrapper = ref(null);
+
+        const curT = ref(0);
+        const durT = ref(0);
+        let albumTimer = null;
+
+        // 拖拽状态
+        const isPaused = ref(false);
+        let dragStartY = 0;
+        let dragActive = false;
+        let dragTriggered = false;
+        const DRAG_THRESHOLD = 50;
+
+        const currentWork = computed(() => works.value[currentWorkIndex.value]);
+        const currentItem = computed(() => currentWork.value?.items[subIndex.value]);
+        const currentDisplayUrl = computed(() => currentItem.value?.url || '');
+        const currentWorkAudioUrl = computed(() => currentWork.value?.audioUrl || '');
+        const currentWorkAudioName = computed(() => currentWork.value?.audioName || '');
+
+        // 监听作品切换：控制音频播放
+        watch(currentWorkIndex, () => {
+            nextTick(() => {
+                if (!bgAudio.value) return;
+                const w = currentWork.value;
+                if (w?.audioUrl && w?.type !== 'video' && !isPaused.value) {
+                    bgAudio.value.play().catch(() => {});
+                } else if (bgAudio.value) {
+                    bgAudio.value.pause();
+                }
+            });
+        });
+
+        const authorWorks = computed(() => {
+            if (!currentWork.value) return [];
+            return works.value.filter(w => w.authorId === currentWork.value.authorId)
+                .map(w => ({ cover: w.items[0].url, index: works.value.indexOf(w), id: w.id, isAlbum: w.items.length > 1, title: w.title }));
+        });
+
+        const isAudioFile = (f) => {
+            if (f.type.startsWith('audio/')) return true;
+            const ext = f.name.split('.').pop().toLowerCase();
+            return AUDIO_EXTS.has(ext);
+        };
+
+        const getCoreName = (filename) => {
+            const nameNoExt = filename.replace(/\.[^/.]+$/, '');
+            const m = nameNoExt.match(/_(\d+)$/);
+            return m ? nameNoExt.substring(0, m.index) : nameNoExt;
+        };
+
+        const handleFileScan = async (e) => {
+            const files = Array.from(e.target.files);
+
+            // 按目录分组（同目录 = 同作者），同时记录每个目录的音频文件
+            const authorMap = new Map();  // dirKey → { files: [], audioFile: null, authorName: '' }
+
+            for (const file of files) {
+                const parts = file.webkitRelativePath.split('/');
+                const dirKey = parts.slice(0, -1).join('/') || '根目录';
+                const fileName = parts[parts.length - 1];
+                const dashParts = fileName.split('-');
+                // 从文件名提取作者名用于显示（第4个 '-' 后 = 第5段）
+                const displayName = dashParts.length >= 5
+                    ? dashParts[4]
+                    : (parts[parts.length - 2] || '未知作者');
+                
+                if (!authorMap.has(dirKey)) {
+                    authorMap.set(dirKey, { files: [], audioFile: null, authorName: displayName });
+                }
+
+                if (isAudioFile(file)) {
+                    authorMap.get(dirKey).audioFile = file;
+                } else {
+                    authorMap.get(dirKey).files.push(file);
+                }
+            }
+
+            const processed = [];
+
+            for (const [, data] of authorMap) {
+                const authorName = data.authorName;
+                const authorFiles = data.files;
+                const audioFile = data.audioFile;
+                const audioUrl = audioFile ? URL.createObjectURL(audioFile) : null;
+                const audioName = audioFile ? audioFile.name : null;
+
+                const imgFiles = authorFiles.filter(f => f.type.startsWith('image/'));
+                const vidFiles = authorFiles.filter(f => f.type.startsWith('video/'));
+
+                const vidItems = [];
+                for (const f of vidFiles) {
+                    const url = URL.createObjectURL(f);
+                    const dur = await getDur(url);
+                    vidItems.push({ url, dur, file: f });
+                }
+
+                // 长视频 > 5s → 独立作品
+                vidItems.filter(v => v.dur > 5).forEach(v => {
+                    processed.push({
+                        id: Math.random(), type: 'video',
+                        title: v.file.name.replace(/\.[^/.]+$/, ""),
+                        authorName, authorId: authorName,
+                        items: [{ url: v.url, type: 'video', dur: v.dur }],
+                        audioUrl, audioName
+                    });
+                });
+
+                const imgItems = imgFiles.map(f => ({
+                    url: URL.createObjectURL(f), type: 'image',
+                    name: f.name, coreName: getCoreName(f.name)
+                }));
+
+                const liveItems = vidItems.filter(v => v.dur <= 5).map(v => ({
+                    url: v.url, type: 'video',
+                    name: v.file.name, dur: v.dur,
+                    coreName: getCoreName(v.file.name)
+                }));
+
+                const groupMap = new Map();
+                for (const item of [...imgItems, ...liveItems]) {
+                    if (!groupMap.has(item.coreName)) groupMap.set(item.coreName, []);
+                    groupMap.get(item.coreName).push(item);
+                }
+
+                for (const [coreName, groupItems] of groupMap) {
+                    const sorted = groupItems.sort((a, b) =>
+                        a.name.localeCompare(b.name, undefined, { numeric: true })
+                    );
+                    if (sorted.length === 1) {
+                        const item = sorted[0];
+                        processed.push({
+                            id: Math.random(), type: 'image',
+                            title: item.name.replace(/\.[^/.]+$/, ""),
+                            authorName, authorId: authorName,
+                            items: [item],
+                            audioUrl, audioName
+                        });
+                    } else {
+                        processed.push({
+                            id: Math.random(), type: 'gallery',
+                            title: coreName,
+                            authorName, authorId: authorName,
+                            items: sorted,
+                            audioUrl, audioName
+                        });
+                    }
+                }
+            }
+
+            works.value = processed;
+            currentWorkIndex.value = 0;
+            startAlbumCycle();
+        };
+
+        const getDur = (url) => new Promise(res => { 
+            const v = document.createElement('video'); v.src = url; 
+            v.onloadedmetadata = () => res(v.duration); v.onerror = () => res(0);
+        });
+
+        const nextWork = () => { 
+            isPaused.value = false;
+            if(currentWorkIndex.value < works.value.length - 1) currentWorkIndex.value++; 
+            else currentWorkIndex.value = 0; 
+            subIndex.value = 0;
+            isDrawerOpen.value = false;
+            startAlbumCycle();
+        };
+        const prevWork = () => { 
+            isPaused.value = false;
+            if(currentWorkIndex.value > 0) currentWorkIndex.value--; 
+            else currentWorkIndex.value = works.value.length - 1; 
+            subIndex.value = 0;
+            isDrawerOpen.value = false;
+            startAlbumCycle();
+        };
+
+        const nextSub = () => { 
+            if (currentWork.value?.type === 'video') {
+                if (videoPlayer.value) {
+                    videoPlayer.value.currentTime = Math.min(videoPlayer.value.currentTime + 5, durT.value || videoPlayer.value.duration);
+                }
+                return;
+            }
+            if (subIndex.value < currentWork.value.items.length - 1) {
+                subIndex.value++; 
+            } else {
+                subIndex.value = 0;
+            }
+            startAlbumCycle();
+        };
+        const prevSub = () => { 
+            if (currentWork.value?.type === 'video') {
+                if (videoPlayer.value) {
+                    videoPlayer.value.currentTime = Math.max(videoPlayer.value.currentTime - 5, 0);
+                }
+                return;
+            }
+            subIndex.value = (subIndex.value - 1 + currentWork.value.items.length) % currentWork.value.items.length; 
+            startAlbumCycle();
+        };
+
+        const startAlbumCycle = () => {
+            clearTimeout(albumTimer);
+            if (isPaused.value) return;
+            if (currentWork.value?.items.length > 1) {
+                const delay = currentItem.value.type === 'video' ? (currentItem.value.dur * 1000) : 4000;
+                albumTimer = setTimeout(() => nextSub(), delay);
+            }
+        };
+
+        /* ===== 滚轮（捕获阶段 + document，双重保障） ===== */
+        let wheelCooldown = false;
+        const handleWheel = (e) => {
+            if (e.target.closest('.drawer') || e.target.closest('.carousel-bar')) return;
+            e.preventDefault();
+            if (wheelCooldown) return;
+            wheelCooldown = true;
+            e.deltaY > 0 ? nextWork() : prevWork();
+            setTimeout(() => wheelCooldown = false, 400);
+        };
+
+        /* ===== 拖拽（在 contentWrapper 上 mousedown + document 上 mousemove/mouseup） ===== */
+        const onDragMouseDown = (e) => {
+            // 排除控件区域
+            if (e.target.closest('.drawer')) return;
+            if (e.target.closest('.carousel-bar')) return;
+            if (e.target.closest('.nav-btn')) return;
+            if (e.target.tagName === 'INPUT') return;
+            // 排除底部控制条（进度条、连播开关等）
+            if (e.target.closest('.bottom-0')) return;
+            dragStartY = e.clientY;
+            dragActive = true;
+        };
+
+        const onDragMouseMove = (e) => {
+            // 不在这里更新 dragStartY，只用于后续 mouseup 判断
+        };
+
+        const onDragMouseUp = (e) => {
+            if (!dragActive) return;
+            const delta = e.clientY - dragStartY;
+            dragActive = false;
+            if (delta < -DRAG_THRESHOLD) {
+                dragTriggered = true;
+                nextWork();
+                setTimeout(() => dragTriggered = false, 150);
+            } else if (delta > DRAG_THRESHOLD) {
+                dragTriggered = true;
+                prevWork();
+                setTimeout(() => dragTriggered = false, 150);
+            }
+        };
+
+        const toggleVideoPlay = () => {
+            if (dragTriggered) return;
+            if (!videoPlayer.value) return;
+            if (videoPlayer.value.paused) {
+                videoPlayer.value.play();
+                isPaused.value = false;
+                if (bgAudio.value) bgAudio.value.play().catch(() => {});
+            } else {
+                videoPlayer.value.pause();
+                isPaused.value = true;
+                if (bgAudio.value) bgAudio.value.pause();
+            }
+        };
+
+        const togglePause = () => {
+            isPaused.value = !isPaused.value;
+            if (isPaused.value) {
+                clearTimeout(albumTimer);
+                if (bgAudio.value) bgAudio.value.pause();
+            } else {
+                startAlbumCycle();
+                if (bgAudio.value) bgAudio.value.play().catch(() => {});
+            }
+        };
+
+        const handleContentClick = (e) => {
+            if (dragTriggered) return;
+            if (currentItem.value?.type === 'video') return;
+            if (e.target.closest('.drawer') || e.target.closest('.carousel-bar') || e.target.closest('.nav-btn') || e.target.closest('.bottom-0')) return;
+            togglePause();
+        };
+
+        const onMediaEnded = () => { 
+            if (isAutoNext.value && currentWork.value?.type === 'video') {
+                nextWork();
+            }
+        };
+
+        const onVideoMeta = () => {
+            if (videoPlayer.value) durT.value = videoPlayer.value.duration;
+        };
+
+        const onVideoUpdate = () => { 
+            curT.value = videoPlayer.value.currentTime; 
+            durT.value = videoPlayer.value.duration || durT.value;
+        };
+
+        const handleKey = (e) => {
+            const k = e.key.toLowerCase();
+            if (k === 'w' || k === 'arrowup') { e.preventDefault(); prevWork(); }
+            if (k === 's' || k === 'arrowdown') { e.preventDefault(); nextWork(); }
+            if (k === 'a' || k === 'arrowleft') prevSub();
+            if (k === 'd' || k === 'arrowright') nextSub();
+            if (k === 'f') { e.preventDefault(); toggleDrawer(); }
+            if (k === 'm') isMuted.value = !isMuted.value;
+            if (k === ' ') { e.preventDefault(); if(currentItem.value?.type === 'video') { toggleVideoPlay(); } else { togglePause(); } }
+        };
+
+        const formatDesc = (t) => t.replace(/(#\S+)/g, '<span class="highlight">$1</span>');
+
+        const handleSeek = (e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const p = (e.clientX - rect.left) / rect.width;
+            if (currentItem.value.type === 'video' && videoPlayer.value) {
+                const d = durT.value || videoPlayer.value.duration || 0;
+                if (d > 0) videoPlayer.value.currentTime = p * d;
+            } else {
+                subIndex.value = Math.floor(p * currentWork.value.items.length);
+            }
+        };
+
+        const toggleDrawer = () => isDrawerOpen.value = !isDrawerOpen.value;
+        const jumpTo = (i) => { isPaused.value = false; currentWorkIndex.value = i; subIndex.value = 0; isDrawerOpen.value = false; startAlbumCycle(); };
+
+        const progress = computed(() => {
+            if (!currentWork.value) return 0;
+            if (currentItem.value.type === 'video') {
+                const d = durT.value || 0;
+                return d > 0 ? (curT.value / d) * 100 : 0;
+            }
+            return ((subIndex.value + 1) / currentWork.value.items.length) * 100;
+        });
+        const timeDisplay = computed(() => {
+            const f = (s) => Math.floor(s/60) + ":" + Math.floor(s%60).toString().padStart(2,'0');
+            return currentItem.value?.type === 'video' ? `${f(curT.value)} / ${f(durT.value)}` : `${subIndex.value + 1} / ${currentWork.value.items.length}`;
+        });
+
+        onMounted(() => {
+            window.addEventListener('keydown', handleKey);
+
+            // 滚轮：window 捕获阶段 + document 冒泡阶段，双保险
+            window.addEventListener('wheel', handleWheel, { passive: false, capture: true });
+            document.addEventListener('wheel', handleWheel, { passive: false });
+
+            // 拖拽：contentWrapper 上 mousedown
+            const cw = contentWrapper.value;
+            if (cw) {
+                cw.addEventListener('mousedown', onDragMouseDown);
+            }
+            document.addEventListener('mousemove', onDragMouseMove);
+            document.addEventListener('mouseup', onDragMouseUp);
+        });
+
+        onUnmounted(() => {
+            window.removeEventListener('keydown', handleKey);
+            window.removeEventListener('wheel', handleWheel, { capture: true });
+            document.removeEventListener('wheel', handleWheel);
+            document.removeEventListener('mousemove', onDragMouseMove);
+            document.removeEventListener('mouseup', onDragMouseUp);
+        });
+
+        return {
+            works, currentWorkIndex, subIndex, currentWork, currentItem, currentDisplayUrl,
+            isPaused, isMuted, isAutoNext, isCleanMode, isDrawerOpen, videoPlayer,
+            bgAudio, currentWorkAudioUrl, currentWorkAudioName, contentWrapper,
+            handleFileScan, formatDesc, nextWork, prevWork, nextSub, prevSub,
+            toggleVideoPlay, handleContentClick, togglePause,
+            onMediaEnded, onVideoUpdate, onVideoMeta,
+            handleSeek, toggleDrawer, jumpTo, progress, timeDisplay, authorWorks
+        };
+    }
+}).mount('#app');
+</script>
+</body>
+</html>
